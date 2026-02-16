@@ -7,11 +7,7 @@ import (
 func main() {
 	proposeC := make(chan string)
 	commitC := make(chan string)
-	go func() {
-		for data := range proposeC {
-			commitC <- data // Мгновенно "согласовываем"
-		}
-	}()
+	NewRaftNode(1, proposeC, commitC)
 	kv := NewKVStore(proposeC, commitC)
 	handler := &HTTPHandler{kvStore: kv}
 	http.ListenAndServe(":8080", handler)
