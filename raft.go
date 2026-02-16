@@ -3,8 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
+	"go.etcd.io/etcd/client/pkg/v3/types"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/rafthttp"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/v2stats"
 	"go.etcd.io/etcd/server/v3/storage/wal"
 	"go.etcd.io/etcd/server/v3/storage/wal/walpb"
 	"go.etcd.io/raft/v3"
@@ -13,7 +19,7 @@ import (
 )
 
 type RaftNode struct {
-	ID uint64
+	ID int
 
 	proposeC    <-chan string
 	commitC     chan<- string
@@ -23,14 +29,18 @@ type RaftNode struct {
 	waldir string
 
 	wal *wal.WAL
+
+	transport *rafthttp.Transport
+	peers     []string
 }
 
-func NewRaftNode(id uint64, proposeC <-chan string, commitC chan<- string) *RaftNode {
+func NewRaftNode(id int, peers []string, proposeC <-chan string, commitC chan<- string) *RaftNode {
 
 	rn := &RaftNode{
 		proposeC: proposeC,
 		commitC:  commitC,
 		waldir:   fmt.Sprintf("wal-%d", id),
+		peers:    peers,
 		ID:       id,
 	}
 	go rn.StartRaft()
@@ -58,7 +68,7 @@ func (rn *RaftNode) StartRaft() {
 	rn.raftStorage.SetHardState(state)
 	rn.raftStorage.Append(ets)
 	config := &raft.Config{
-		ID:              rn.ID,
+		ID:              uint64(rn.ID),
 		ElectionTick:    10,
 		HeartbeatTick:   1,
 		Storage:         rn.raftStorage,
@@ -69,8 +79,11 @@ func (rn *RaftNode) StartRaft() {
 	if oldwal {
 		rn.node = raft.RestartNode(config)
 	} else {
-		peers := []raft.Peer{{ID: rn.ID}}
-		rn.node = raft.StartNode(config, peers)
+		rpeers := make([]raft.Peer, len(rn.peers))
+		for i := range rpeers {
+			rpeers[i] = raft.Peer{ID: uint64(i + 1)}
+		}
+		rn.node = raft.StartNode(config, rpeers)
 	}
 
 	// ITERATE AND REPLAY COMMITTED ENTRIES
@@ -89,8 +102,24 @@ func (rn *RaftNode) StartRaft() {
 			}
 		}
 	}
+	rn.transport = &rafthttp.Transport{
+		ID:          types.ID(rn.ID),
+		ClusterID:   0x1000,
+		Raft:        rn,
+		ServerStats: v2stats.NewServerStats(strconv.Itoa(rn.ID), strconv.Itoa(rn.ID)),
+		LeaderStats: v2stats.NewLeaderStats(zap.NewExample(), strconv.Itoa(int(rn.ID))),
+		ErrorC:      make(chan error),
+	}
+	rn.transport.Start()
+	for i := range rn.peers {
+		if i+1 != rn.ID {
+			rn.transport.AddPeer(types.ID(i+1), []string{rn.peers[i]})
+		}
+	}
 
+	go rn.serveRaft()
 	go rn.serveChannels()
+
 }
 func (rn *RaftNode) serveChannels() {
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -108,6 +137,9 @@ func (rn *RaftNode) serveChannels() {
 			if err != nil {
 				panic(err)
 			}
+
+			rn.transport.Send(rd.Messages)
+
 			if !raft.IsEmptyHardState(rd.HardState) {
 				rn.raftStorage.SetHardState(rd.HardState)
 			}
@@ -131,4 +163,23 @@ func (rn *RaftNode) serveChannels() {
 			rn.node.Advance()
 		}
 	}
+}
+func (rc *RaftNode) serveRaft() {
+	url, err := url.Parse(rc.peers[rc.ID-1])
+	if err != nil {
+		panic(err)
+	}
+	err = http.ListenAndServe(url.Host, rc.transport.Handler())
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (rc *RaftNode) Process(ctx context.Context, m raftpb.Message) error {
+	return rc.node.Step(ctx, m)
+}
+func (rc *RaftNode) IsIDRemoved(_ uint64) bool   { return false }
+func (rc *RaftNode) ReportUnreachable(id uint64) { rc.node.ReportUnreachable(id) }
+func (rc *RaftNode) ReportSnapshot(id uint64, status raft.SnapshotStatus) {
+	rc.node.ReportSnapshot(id, status)
 }
